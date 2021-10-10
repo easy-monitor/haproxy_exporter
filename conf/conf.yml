@@ -1,0 +1,7 @@
+module:
+  - name: haproxy01
+    user: admin
+    password: admin
+  - name: haproxy02
+    user: admin
+    password: admin

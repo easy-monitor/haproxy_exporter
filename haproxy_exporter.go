@@ -19,6 +19,8 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gopkg.in/yaml.v2"
 	"io"
 	"io/ioutil"
 	"net"
@@ -26,6 +28,7 @@ import (
 	_ "net/http/pprof"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,7 +38,6 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
@@ -565,7 +567,7 @@ func main() {
 		haProxyServerMetricFields  = kingpin.Flag("haproxy.server-metric-fields", "Comma-separated list of exported server metrics. See http://cbonte.github.io/haproxy-dconv/configuration-1.5.html#9.1").Default(serverMetrics.String()).String()
 		haProxyServerExcludeStates = kingpin.Flag("haproxy.server-exclude-states", "Comma-separated list of exported server states to exclude. See https://cbonte.github.io/haproxy-dconv/1.8/management.html#9.1, field 17 statuus").Default(excludedServerStates).String()
 		haProxyTimeout             = kingpin.Flag("haproxy.timeout", "Timeout for trying to get stats from HAProxy.").Default("5s").Duration()
-		haProxyPidFile             = kingpin.Flag("haproxy.pid-file", pidFileHelpText).Default("").String()
+		//haProxyPidFile             = kingpin.Flag("haproxy.pid-file", pidFileHelpText).Default("").String()
 	)
 
 	promlogConfig := &promlog.Config{}
@@ -584,34 +586,35 @@ func main() {
 	level.Info(logger).Log("msg", "Starting haproxy_exporter", "version", version.Info())
 	level.Info(logger).Log("msg", "Build context", "context", version.BuildContext())
 
-	exporter, err := NewExporter(*haProxyScrapeURI, *haProxySSLVerify, selectedServerMetrics, *haProxyServerExcludeStates, *haProxyTimeout, logger)
-	if err != nil {
-		level.Error(logger).Log("msg", "Error creating an exporter", "err", err)
-		os.Exit(1)
-	}
-	prometheus.MustRegister(exporter)
-	prometheus.MustRegister(version.NewCollector("haproxy_exporter"))
+	//exporter, err := NewExporter(*haProxyScrapeURI, *haProxySSLVerify, selectedServerMetrics, *haProxyServerExcludeStates, *haProxyTimeout, logger)
+	//if err != nil {
+	//	level.Error(logger).Log("msg", "Error creating an exporter", "err", err)
+	//	os.Exit(1)
+	//}
+	//prometheus.MustRegister(exporter)
+	//prometheus.MustRegister(version.NewCollector("haproxy_exporter"))
 
-	if *haProxyPidFile != "" {
-		procExporter := prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{
-			PidFn: func() (int, error) {
-				content, err := ioutil.ReadFile(*haProxyPidFile)
-				if err != nil {
-					return 0, fmt.Errorf("can't read pid file: %s", err)
-				}
-				value, err := strconv.Atoi(strings.TrimSpace(string(content)))
-				if err != nil {
-					return 0, fmt.Errorf("can't parse pid file: %s", err)
-				}
-				return value, nil
-			},
-			Namespace: namespace,
-		})
-		prometheus.MustRegister(procExporter)
-	}
+	//if *haProxyPidFile != "" {
+	//	procExporter := prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{
+	//		PidFn: func() (int, error) {
+	//			content, err := ioutil.ReadFile(*haProxyPidFile)
+	//			if err != nil {
+	//				return 0, fmt.Errorf("can't read pid file: %s", err)
+	//			}
+	//			value, err := strconv.Atoi(strings.TrimSpace(string(content)))
+	//			if err != nil {
+	//				return 0, fmt.Errorf("can't parse pid file: %s", err)
+	//			}
+	//			return value, nil
+	//		},
+	//		Namespace: namespace,
+	//	})
+	//	prometheus.MustRegister(procExporter)
+	//}
 
 	level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
-	http.Handle(*metricsPath, promhttp.Handler())
+	//http.Handle(*metricsPath, promhttp.Handler())
+	http.HandleFunc(*metricsPath, handler(*haProxyScrapeURI, *haProxySSLVerify, selectedServerMetrics, *haProxyServerExcludeStates, *haProxyTimeout, logger))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<html>
              <head><title>Haproxy Exporter</title></head>
@@ -626,4 +629,86 @@ func main() {
 		level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
 		os.Exit(1)
 	}
+}
+
+func handler(haProxyScrapeURI string, haProxySSLVerify bool, selectedServerMetrics map[int]metricInfo, haProxyServerExcludeStates string, haProxyTimeout time.Duration, logger log.Logger) func(w http.ResponseWriter, r *http.Request, ) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		target := query.Get("target")
+		module := query.Get("module")
+		conf, _ := loadConfig()
+
+		var user string
+		var password string
+		var isBreak bool
+
+		if target == "" {
+			buf := "uri error, not found target"
+			w.Write([]byte(buf))
+			return
+		}
+
+		haProxyScrapeURI = target + ";csv"
+		if module != "" {
+			for i := 0; i < len(conf.Modules); i++ {
+				if conf.Modules[i].Name == module {
+					user = conf.Modules[i].User
+					password = conf.Modules[i].Password
+					isBreak = true
+				}
+			}
+
+			if !isBreak {
+				buf := "not found module in conf.yml"
+				w.Write([]byte(buf))
+				return
+			}
+			fmt.Println(target)
+			temp := strings.Split(target, "//")
+			authInfo := fmt.Sprintf("%v:%v", user, password)
+			haProxyScrapeURI = fmt.Sprintf("%s%s%s@%s%s", temp[0], "//", authInfo, temp[1], ";csv")
+		}
+		haProxySSLVerify = false
+
+		exporter, err := NewExporter(haProxyScrapeURI, haProxySSLVerify, selectedServerMetrics, haProxyServerExcludeStates, haProxyTimeout, logger)
+		if err != nil {
+			level.Error(logger).Log("msg", "Error creating an exporter", "err", err)
+			//os.Exit(1)
+			buf := fmt.Sprintf("%v: %v", "error: ", err)
+			w.Write([]byte(buf))
+			return
+		}
+
+		registerer := prometheus.NewRegistry()
+		registerer.MustRegister(exporter)
+		registerer.MustRegister(version.NewCollector("haproxy_exporter"))
+		//prometheus.MustRegister(exporter)
+		//prometheus.MustRegister(version.NewCollector("haproxy_exporter"))
+
+		gatherers := prometheus.Gatherers{}
+		gatherers = append(gatherers, registerer)
+
+		// Delegate http serving to Prometheus client library, which will call collector.Collect.
+		h := promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{
+			ErrorHandling: promhttp.ContinueOnError,
+		})
+
+		h.ServeHTTP(w, r)
+
+	}
+}
+
+func loadConfig() (*Config, error) {
+	path, _ := os.Getwd()
+	path = filepath.Join(path, "conf/conf.yml")
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, errors.New("read conf.yml fail, path: " + path)
+	}
+	conf := new(Config)
+	err = yaml.Unmarshal(data, conf)
+	if err != nil {
+		return nil, errors.New("unmarshal conf.yml fail")
+	}
+	return conf, nil
 }
